@@ -99,6 +99,8 @@ class MaskDecoder(nn.Module):
         )
 
         # Select the correct mask or masks for output
+        # 模型预测有两种模式，如果是单mask 模式，那么就取第 0 个，如果是多 mask 模式，就取 1～3个
+        # 这个应该和训练模式有关系
         if multimask_output:
             mask_slice = slice(1, None)
         else:
@@ -120,16 +122,24 @@ class MaskDecoder(nn.Module):
         # Concatenate output tokens
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
-        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
+        # 一共有7个序列的token，第一个是mask iou 质量预测
+        # 第2 3 4 5 个是 mask embedding
+        # 第 6 个 是交互的点或者框的可学习的 embedding, 让模型学习到这些点或者框的位置信息
+
+        # 模型是预测3个不同粒度的mask,为啥 mask_tokens 是4个？ 原文中说道
+        # 如果用户输入的 prompt 很多其实是没有模糊问题的，mask 应该是很明确的，这时候监督就应该是单 mask 监督
+        # 所以作者用第 0 个 token 来学习这种情况。训练时候，当用户如果多个prompt时候就是训练第 0 个 token
+        # 否则训练第 1～3 个 token。
+        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)  # 一般是加法，这里是 cat ?
 
         # Expand per-image data in batch direction to be per-mask
         src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
-        src = src + dense_prompt_embeddings
+        src = src + dense_prompt_embeddings  # dense 的加到 image_embeddings 上而不是 tokens
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
         # Run the transformer
-        hs, src = self.transformer(src, pos_src, tokens)
+        hs, src = self.transformer(src, pos_src, tokens)  # src=key, pos_src=key_pos, tokens=query
         iou_token_out = hs[:, 0, :]
         mask_tokens_out = hs[:, 1 : (1 + self.num_mask_tokens), :]
 
@@ -137,6 +147,7 @@ class MaskDecoder(nn.Module):
         src = src.transpose(1, 2).view(b, c, h, w)
         upscaled_embedding = self.output_upscaling(src)
         hyper_in_list: List[torch.Tensor] = []
+        # 学习的是 mask embeddding，然后和 upscaled_embedding 做点积，得到 mask，参考了 maskformer 做法
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)
